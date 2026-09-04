@@ -1,9 +1,13 @@
 build/
 output*
 *.h5
+*.mp4
 *.o
 *.so
+__pycache__/
+*.py[cod]
 .DS_Store
-output_smoke/
-QHD.code-workspace
+*.code-workspace
+/CMakeCache.txt
+/CMakeFiles/
 Backtrace*

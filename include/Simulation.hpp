@@ -27,20 +27,30 @@ private:
     using VectorField = vecops::VectorField2D;
     using PressureTensor = vecops::SymmetricTensorField2D;
 
+    struct StateData {
+        VectorField b;
+        VectorField q;
+        VectorField u;
+        PressureTensor p;
+    };
+
+    struct StageData {
+        VectorField rhs;
+        VectorField rk_q0;
+        VectorField rk_accum;
+        VectorField work_b;
+        VectorField work_q;
+        VectorField work_cross;
+        VectorField work_divp;
+    };
+
     struct LevelData {
         amrex::Geometry geom;
         amrex::BoxArray ba;
         amrex::DistributionMapping dmap;
 
-        VectorField b;
-        VectorField q;
-        VectorField u;
-        PressureTensor p;
-        VectorField rhs;
-        VectorField work_b;
-        VectorField work_q;
-        VectorField work_cross;
-        VectorField work_divp;
+        StateData state;
+        StageData stage;
     };
 
     struct GatheredPressureState {
@@ -68,18 +78,43 @@ private:
 
     void fill_level_ghosts(VectorField& field);
     void fill_level_ghosts(PressureTensor& field);
-    void compute_u_from_b(const VectorField& b, VectorField& u);
-    void compute_q_from_b(const VectorField& b, VectorField& u, VectorField& q);
+    void compute_u_from_b(const VectorField& b, VectorField& u, StageData& stage);
+    void compute_q_from_b(const VectorField& b, VectorField& u, VectorField& q, StageData& stage);
     void compute_default_pressure_from_filled(const VectorField& u, PressureTensor& p);
-    void update_pressure(amrex::Real time, amrex::Real dt, int step);
+    void update_pressure(StateData& state, amrex::Real time, amrex::Real dt, int step);
     void compute_div_pressure_from_filled(const PressureTensor& p, VectorField& divp);
-    void compute_rhs(const VectorField& b,
-                     const VectorField& q,
-                     const VectorField& u,
-                     const PressureTensor& p,
-                     VectorField& rhs);
+    void compute_rhs(const StateData& state, VectorField& rhs, StageData& stage);
+    void refresh_derived_state(StateData& state,
+                               StageData& stage,
+                               amrex::Real time,
+                               amrex::Real dt,
+                               int step);
+    void refresh_derived_state_timed(StateData& state,
+                                     StageData& stage,
+                                     amrex::Real time,
+                                     amrex::Real dt,
+                                     int step,
+                                     amrex::Real& helmholtz_wall_total,
+                                     amrex::Real& velocity_wall_total,
+                                     amrex::Real& pressure_wall_total);
+    void evaluate_rhs_stage(StateData& state,
+                            StageData& stage,
+                            amrex::Real time,
+                            amrex::Real dt,
+                            int step,
+                            amrex::Real& rhs_wall_total,
+                            amrex::Real& helmholtz_wall_total,
+                            amrex::Real& velocity_wall_total,
+                            amrex::Real& pressure_wall_total);
+    void advance_rk4(amrex::Real time,
+                     amrex::Real dt,
+                     int step,
+                     amrex::Real& rhs_wall_total,
+                     amrex::Real& helmholtz_wall_total,
+                     amrex::Real& velocity_wall_total,
+                     amrex::Real& pressure_wall_total);
 
-    void solve_helmholtz();
+    void solve_helmholtz(const VectorField& q, VectorField& b);
 
     void write_output(int step, amrex::Real time);
 

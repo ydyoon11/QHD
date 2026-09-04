@@ -598,14 +598,12 @@ Simulation::Simulation(const SimulationConfig& cfg)
     initialize_state();
 
     if (!init_has_b_ && init_has_q_) {
-        solve_helmholtz();
-        compute_u_from_b(level_.b, level_.u);
-        fill_level_ghosts(level_.u);
+        refresh_derived_state(level_.state, level_.stage, 0.0_rt, cfg_.dt, 0);
     } else if (init_has_b_ && !init_has_q_) {
-        compute_q_from_b(level_.b, level_.u, level_.q);
+        compute_q_from_b(level_.state.b, level_.state.u, level_.state.q, level_.stage);
     } else if (init_has_b_ && init_has_q_) {
-        compute_u_from_b(level_.b, level_.u);
-        fill_level_ghosts(level_.u);
+        compute_u_from_b(level_.state.b, level_.state.u, level_.stage);
+        fill_level_ghosts(level_.state.u);
     } else {
         throw std::runtime_error("Initialization did not provide either B or Q");
     }
@@ -642,7 +640,7 @@ Simulation::Simulation(const SimulationConfig& cfg)
         define_pressure_gather_buffers();
     }
 
-    update_pressure(0.0_rt, cfg_.dt, 0);
+    update_pressure(level_.state, 0.0_rt, cfg_.dt, 0);
 
     if (ParallelDescriptor::IOProcessor()) {
         Print() << "Initialized staggered single-level AMReX solver with AMReX FFT Helmholtz inversion\n";
@@ -656,15 +654,17 @@ void Simulation::define_level(const Geometry& geom, const BoxArray& ba) {
     level_.ba = ba;
     level_.dmap = DistributionMapping(ba);
 
-    vecops::define_field(level_.ba, level_.dmap, ng_, level_.b);
-    vecops::define_field(level_.ba, level_.dmap, ng_, level_.q);
-    vecops::define_field(level_.ba, level_.dmap, ng_, level_.u);
-    vecops::define_field(level_.ba, level_.dmap, ng_, level_.p);
-    vecops::define_field(level_.ba, level_.dmap, ng_, level_.rhs);
-    vecops::define_field(level_.ba, level_.dmap, ng_, level_.work_b);
-    vecops::define_field(level_.ba, level_.dmap, ng_, level_.work_q);
-    vecops::define_field(level_.ba, level_.dmap, ng_, level_.work_cross);
-    vecops::define_field(level_.ba, level_.dmap, ng_, level_.work_divp);
+    vecops::define_field(level_.ba, level_.dmap, ng_, level_.state.b);
+    vecops::define_field(level_.ba, level_.dmap, ng_, level_.state.q);
+    vecops::define_field(level_.ba, level_.dmap, ng_, level_.state.u);
+    vecops::define_field(level_.ba, level_.dmap, ng_, level_.state.p);
+    vecops::define_field(level_.ba, level_.dmap, ng_, level_.stage.rhs);
+    vecops::define_field(level_.ba, level_.dmap, ng_, level_.stage.rk_q0);
+    vecops::define_field(level_.ba, level_.dmap, ng_, level_.stage.rk_accum);
+    vecops::define_field(level_.ba, level_.dmap, ng_, level_.stage.work_b);
+    vecops::define_field(level_.ba, level_.dmap, ng_, level_.stage.work_q);
+    vecops::define_field(level_.ba, level_.dmap, ng_, level_.stage.work_cross);
+    vecops::define_field(level_.ba, level_.dmap, ng_, level_.stage.work_divp);
 }
 
 void Simulation::define_pressure_gather_buffers() {
@@ -722,11 +722,11 @@ void Simulation::initialize_analytic_magnetic_field() {
     const Real quarter_lx = Real(0.25) * lx;
     const Real quarter_ly = Real(0.25) * ly;
 
-    for (MFIter mfi(level_.b.comp[vecops::X]); mfi.isValid(); ++mfi) {
+    for (MFIter mfi(level_.state.b.comp[vecops::X]); mfi.isValid(); ++mfi) {
         const Box& box = mfi.validbox();
-        const auto bx = level_.b.comp[vecops::X].array(mfi);
-        const auto by = level_.b.comp[vecops::Y].array(mfi);
-        const auto bz = level_.b.comp[vecops::Z].array(mfi);
+        const auto bx = level_.state.b.comp[vecops::X].array(mfi);
+        const auto by = level_.state.b.comp[vecops::Y].array(mfi);
+        const auto bz = level_.state.b.comp[vecops::Z].array(mfi);
         ParallelFor(box, [=] AMREX_GPU_DEVICE(int i, int j, int) noexcept {
             const Real x_x = (i + Real(0.5)) * dx;
             const Real y_x = j * dy;
@@ -816,20 +816,20 @@ void Simulation::initialize_state_from_python_namelist() {
     const int active_nx = level_.geom.Domain().length(0);
     const int active_ny = level_.geom.Domain().length(1);
     if (init_has_b_) {
-        load_array_into_multifab((temp_root / "bx.npy").string(), level_.b.comp[vecops::X], active_ny, active_nx, 0, false);
-        load_array_into_multifab((temp_root / "by.npy").string(), level_.b.comp[vecops::Y], active_ny, active_nx, 0, false);
-        load_array_into_multifab((temp_root / "bz.npy").string(), level_.b.comp[vecops::Z], active_ny, active_nx, 0, false);
+        load_array_into_multifab((temp_root / "bx.npy").string(), level_.state.b.comp[vecops::X], active_ny, active_nx, 0, false);
+        load_array_into_multifab((temp_root / "by.npy").string(), level_.state.b.comp[vecops::Y], active_ny, active_nx, 0, false);
+        load_array_into_multifab((temp_root / "bz.npy").string(), level_.state.b.comp[vecops::Z], active_ny, active_nx, 0, false);
         if (!init_has_q_) {
-            load_array_into_multifab((temp_root / "bx.npy").string(), level_.work_b.comp[vecops::X], active_ny, active_nx, 0, true);
-            load_array_into_multifab((temp_root / "by.npy").string(), level_.work_b.comp[vecops::Y], active_ny, active_nx, 0, true);
-            load_array_into_multifab((temp_root / "bz.npy").string(), level_.work_b.comp[vecops::Z], active_ny, active_nx, 0, true);
+            load_array_into_multifab((temp_root / "bx.npy").string(), level_.stage.work_b.comp[vecops::X], active_ny, active_nx, 0, true);
+            load_array_into_multifab((temp_root / "by.npy").string(), level_.stage.work_b.comp[vecops::Y], active_ny, active_nx, 0, true);
+            load_array_into_multifab((temp_root / "bz.npy").string(), level_.stage.work_b.comp[vecops::Z], active_ny, active_nx, 0, true);
             init_b_ghosts_ready_ = true;
         }
     }
     if (init_has_q_) {
-        load_array_into_multifab((temp_root / "qx.npy").string(), level_.q.comp[vecops::X], active_ny, active_nx, 0, false);
-        load_array_into_multifab((temp_root / "qy.npy").string(), level_.q.comp[vecops::Y], active_ny, active_nx, 0, false);
-        load_array_into_multifab((temp_root / "qz.npy").string(), level_.q.comp[vecops::Z], active_ny, active_nx, 0, false);
+        load_array_into_multifab((temp_root / "qx.npy").string(), level_.state.q.comp[vecops::X], active_ny, active_nx, 0, false);
+        load_array_into_multifab((temp_root / "qy.npy").string(), level_.state.q.comp[vecops::Y], active_ny, active_nx, 0, false);
+        load_array_into_multifab((temp_root / "qz.npy").string(), level_.state.q.comp[vecops::Z], active_ny, active_nx, 0, false);
     }
 
     ParallelDescriptor::Barrier();
@@ -874,26 +874,26 @@ void Simulation::fill_level_ghosts(PressureTensor& field) {
     vecops::fill_periodic(level_.geom, field);
 }
 
-void Simulation::compute_u_from_b(const VectorField& b, VectorField& u) {
-    vecops::copy(b, level_.work_b);
-    fill_level_ghosts(level_.work_b);
-    vecops::compute_u_from_b_filled(level_.geom, level_.work_b, u);
+void Simulation::compute_u_from_b(const VectorField& b, VectorField& u, StageData& stage) {
+    vecops::copy(b, stage.work_b);
+    fill_level_ghosts(stage.work_b);
+    vecops::compute_u_from_b_filled(level_.geom, stage.work_b, u);
 }
 
-void Simulation::compute_q_from_b(const VectorField& b, VectorField& u, VectorField& q) {
+void Simulation::compute_q_from_b(const VectorField& b, VectorField& u, VectorField& q, StageData& stage) {
     if (init_b_ghosts_ready_) {
-        vecops::compute_u_from_b_filled(level_.geom, level_.work_b, u);
+        vecops::compute_u_from_b_filled(level_.geom, stage.work_b, u);
         fill_level_ghosts(u);
-        vecops::compute_q_from_b_filled(level_.geom, level_.work_b, q);
+        vecops::compute_q_from_b_filled(level_.geom, stage.work_b, q);
         init_b_ghosts_ready_ = false;
         return;
     }
 
-    vecops::copy(b, level_.work_b);
-    fill_level_ghosts(level_.work_b);
-    vecops::compute_u_from_b_filled(level_.geom, level_.work_b, u);
+    vecops::copy(b, stage.work_b);
+    fill_level_ghosts(stage.work_b);
+    vecops::compute_u_from_b_filled(level_.geom, stage.work_b, u);
     fill_level_ghosts(u);
-    vecops::compute_q_from_b_filled(level_.geom, level_.work_b, q);
+    vecops::compute_q_from_b_filled(level_.geom, stage.work_b, q);
 }
 
 void Simulation::compute_default_pressure_from_filled(const VectorField& u, PressureTensor& p) {
@@ -929,11 +929,11 @@ void Simulation::compute_default_pressure_from_filled(const VectorField& u, Pres
     }
 }
 
-void Simulation::update_pressure(Real time, Real dt, int step) {
+void Simulation::update_pressure(StateData& state, Real time, Real dt, int step) {
     if (!has_python_pressure_closure_) {
-        compute_default_pressure_from_filled(level_.u, level_.p);
-        fill_level_ghosts(level_.p);
-        ensure_finite_tensor("Pressure", level_.p);
+        compute_default_pressure_from_filled(state.u, state.p);
+        fill_level_ghosts(state.p);
+        ensure_finite_tensor("Pressure", state.p);
         return;
     }
 
@@ -941,22 +941,22 @@ void Simulation::update_pressure(Real time, Real dt, int step) {
 
     if (pressure_engine_->needs_b()) {
         for (int n = 0; n < 3; ++n) {
-            pressure_gather_.b[n].ParallelCopy(level_.b.comp[n], 0, 0, 1, 0, 0, level_.geom.periodicity());
+            pressure_gather_.b[n].ParallelCopy(state.b.comp[n], 0, 0, 1, 0, 0, level_.geom.periodicity());
         }
     }
     if (pressure_engine_->needs_q()) {
         for (int n = 0; n < 3; ++n) {
-            pressure_gather_.q[n].ParallelCopy(level_.q.comp[n], 0, 0, 1, 0, 0, level_.geom.periodicity());
+            pressure_gather_.q[n].ParallelCopy(state.q.comp[n], 0, 0, 1, 0, 0, level_.geom.periodicity());
         }
     }
     if (pressure_engine_->needs_u()) {
         for (int n = 0; n < 3; ++n) {
-            pressure_gather_.u[n].ParallelCopy(level_.u.comp[n], 0, 0, 1, 0, 0, level_.geom.periodicity());
+            pressure_gather_.u[n].ParallelCopy(state.u.comp[n], 0, 0, 1, 0, 0, level_.geom.periodicity());
         }
     }
     if (pressure_engine_->needs_p()) {
         for (int n = 0; n < 6; ++n) {
-            pressure_gather_.p_in[n].ParallelCopy(level_.p.comp[n], 0, 0, 1, 0, 0, level_.geom.periodicity());
+            pressure_gather_.p_in[n].ParallelCopy(state.p.comp[n], 0, 0, 1, 0, 0, level_.geom.periodicity());
         }
     }
 
@@ -981,11 +981,11 @@ void Simulation::update_pressure(Real time, Real dt, int step) {
         throw std::runtime_error("Embedded Python pressure closure evaluation failed");
     }
     for (int n = 0; n < 6; ++n) {
-        level_.p.comp[n].ParallelCopy(pressure_gather_.p_out[n], 0, 0, 1, 0, 0, level_.geom.periodicity());
+        state.p.comp[n].ParallelCopy(pressure_gather_.p_out[n], 0, 0, 1, 0, 0, level_.geom.periodicity());
     }
 
-    fill_level_ghosts(level_.p);
-    ensure_finite_tensor("Pressure", level_.p);
+    fill_level_ghosts(state.p);
+    ensure_finite_tensor("Pressure", state.p);
 }
 
 void Simulation::compute_div_pressure_from_filled(const PressureTensor& p, VectorField& divp) {
@@ -1013,29 +1013,25 @@ void Simulation::compute_div_pressure_from_filled(const PressureTensor& p, Vecto
     }
 }
 
-void Simulation::compute_rhs(const VectorField& b,
-                             const VectorField& q,
-                             const VectorField& u,
-                             const PressureTensor& p,
-                             VectorField& rhs) {
-    vecops::copy(b, level_.work_b);
-    vecops::copy(q, level_.work_q);
-    fill_level_ghosts(level_.work_b);
-    fill_level_ghosts(level_.work_q);
+void Simulation::compute_rhs(const StateData& state, VectorField& rhs, StageData& stage) {
+    vecops::copy(state.b, stage.work_b);
+    vecops::copy(state.q, stage.work_q);
+    fill_level_ghosts(stage.work_b);
+    fill_level_ghosts(stage.work_q);
 
-    vecops::compute_cross_product(u, level_.work_q, level_.work_cross);
-    compute_div_pressure_from_filled(p, level_.work_divp);
-    vecops::saxpy(level_.work_cross, -1.0, level_.work_divp);
-    fill_level_ghosts(level_.work_cross);
-    vecops::compute_curl_from_filled(level_.geom, level_.work_cross, rhs);
+    vecops::compute_cross_product(state.u, stage.work_q, stage.work_cross);
+    compute_div_pressure_from_filled(state.p, stage.work_divp);
+    vecops::saxpy(stage.work_cross, -1.0, stage.work_divp);
+    fill_level_ghosts(stage.work_cross);
+    vecops::compute_curl_from_filled(level_.geom, stage.work_cross, rhs);
 
     if (cfg_.eta != Real(0.0)) {
         for (int n = 0; n < 3; ++n) {
             for (MFIter mfi(rhs.comp[n]); mfi.isValid(); ++mfi) {
                 const Box& box = mfi.validbox();
                 const auto out = rhs.comp[n].array(mfi);
-                const auto qarr = level_.work_q.comp[n].const_array(mfi);
-                const auto barr = level_.work_b.comp[n].const_array(mfi);
+                const auto qarr = stage.work_q.comp[n].const_array(mfi);
+                const auto barr = stage.work_b.comp[n].const_array(mfi);
                 const Real eta = cfg_.eta;
                 ParallelFor(box, [=] AMREX_GPU_DEVICE(int i, int j, int) noexcept {
                     out(i, j, 0) -= eta * (qarr(i, j, 0) + barr(i, j, 0));
@@ -1047,7 +1043,100 @@ void Simulation::compute_rhs(const VectorField& b,
     ensure_finite_field("RHS", rhs);
 }
 
-void Simulation::solve_helmholtz() {
+void Simulation::refresh_derived_state(StateData& state,
+                                       StageData& stage,
+                                       Real time,
+                                       Real dt,
+                                       int step) {
+    solve_helmholtz(state.q, state.b);
+    compute_u_from_b(state.b, state.u, stage);
+    fill_level_ghosts(state.u);
+    update_pressure(state, time, dt, step);
+}
+
+void Simulation::refresh_derived_state_timed(StateData& state,
+                                             StageData& stage,
+                                             Real time,
+                                             Real dt,
+                                             int step,
+                                             Real& helmholtz_wall_total,
+                                             Real& velocity_wall_total,
+                                             Real& pressure_wall_total) {
+    const Real helmholtz_wall_start = ParallelDescriptor::second();
+    solve_helmholtz(state.q, state.b);
+    helmholtz_wall_total += ParallelDescriptor::second() - helmholtz_wall_start;
+
+    const Real velocity_wall_start = ParallelDescriptor::second();
+    compute_u_from_b(state.b, state.u, stage);
+    fill_level_ghosts(state.u);
+    velocity_wall_total += ParallelDescriptor::second() - velocity_wall_start;
+
+    const Real pressure_wall_start = ParallelDescriptor::second();
+    update_pressure(state, time, dt, step);
+    pressure_wall_total += ParallelDescriptor::second() - pressure_wall_start;
+}
+
+void Simulation::evaluate_rhs_stage(StateData& state,
+                                    StageData& stage,
+                                    Real time,
+                                    Real dt,
+                                    int step,
+                                    Real& rhs_wall_total,
+                                    Real& helmholtz_wall_total,
+                                    Real& velocity_wall_total,
+                                    Real& pressure_wall_total) {
+    refresh_derived_state_timed(state, stage, time, dt, step,
+                                helmholtz_wall_total, velocity_wall_total, pressure_wall_total);
+
+    const Real rhs_wall_start = ParallelDescriptor::second();
+    compute_rhs(state, stage.rhs, stage);
+    rhs_wall_total += ParallelDescriptor::second() - rhs_wall_start;
+}
+
+void Simulation::advance_rk4(Real time,
+                             Real dt,
+                             int step,
+                             Real& rhs_wall_total,
+                             Real& helmholtz_wall_total,
+                             Real& velocity_wall_total,
+                             Real& pressure_wall_total) {
+    auto& state = level_.state;
+    auto& stage = level_.stage;
+    const int next_step = step + 1;
+
+    vecops::copy(state.q, stage.rk_q0);
+    vecops::set_val(stage.rk_accum, 0.0_rt);
+
+    const Real rhs_wall_start = ParallelDescriptor::second();
+    compute_rhs(state, stage.rhs, stage);
+    rhs_wall_total += ParallelDescriptor::second() - rhs_wall_start;
+    vecops::saxpy(stage.rk_accum, 1.0_rt / 6.0_rt, stage.rhs);
+
+    vecops::copy(stage.rk_q0, state.q);
+    vecops::saxpy(state.q, 0.5_rt * dt, stage.rhs);
+    evaluate_rhs_stage(state, stage, time + 0.5_rt * dt, dt, next_step,
+                       rhs_wall_total, helmholtz_wall_total, velocity_wall_total, pressure_wall_total);
+    vecops::saxpy(stage.rk_accum, 1.0_rt / 3.0_rt, stage.rhs);
+
+    vecops::copy(stage.rk_q0, state.q);
+    vecops::saxpy(state.q, 0.5_rt * dt, stage.rhs);
+    evaluate_rhs_stage(state, stage, time + 0.5_rt * dt, dt, next_step,
+                       rhs_wall_total, helmholtz_wall_total, velocity_wall_total, pressure_wall_total);
+    vecops::saxpy(stage.rk_accum, 1.0_rt / 3.0_rt, stage.rhs);
+
+    vecops::copy(stage.rk_q0, state.q);
+    vecops::saxpy(state.q, dt, stage.rhs);
+    evaluate_rhs_stage(state, stage, time + dt, dt, next_step,
+                       rhs_wall_total, helmholtz_wall_total, velocity_wall_total, pressure_wall_total);
+    vecops::saxpy(stage.rk_accum, 1.0_rt / 6.0_rt, stage.rhs);
+
+    vecops::copy(stage.rk_q0, state.q);
+    vecops::saxpy(state.q, dt, stage.rk_accum);
+    refresh_derived_state_timed(state, stage, time + dt, dt, next_step,
+                                helmholtz_wall_total, velocity_wall_total, pressure_wall_total);
+}
+
+void Simulation::solve_helmholtz(const VectorField& q, VectorField& b) {
     const int nx = level_.geom.Domain().length(0);
     const int ny = level_.geom.Domain().length(1);
     const Real idx2 = Real(1.0) / (level_.geom.CellSize(0) * level_.geom.CellSize(0));
@@ -1056,8 +1145,8 @@ void Simulation::solve_helmholtz() {
     const Real scaling = helmholtz_fft_->scalingFactor();
 
     for (int comp = 0; comp < 3; ++comp) {
-        MultiFab& bcomp = level_.b.comp[comp];
-        const MultiFab& qcomp = level_.q.comp[comp];
+        MultiFab& bcomp = b.comp[comp];
+        const MultiFab& qcomp = q.comp[comp];
         ensure_finite("Helmholtz q", qcomp);
 
         helmholtz_fft_->forwardThenBackward(
@@ -1079,29 +1168,29 @@ void Simulation::write_output(int step, Real time) {
         "Bx", "By", "Bz", "Ux", "Uy", "Uz", "Qx", "Qy", "Qz",
         "Pxx", "Pxy", "Pxz", "Pyy", "Pyz", "Pzz", "TrP"};
 
-    fill_level_ghosts(level_.b);
-    fill_level_ghosts(level_.u);
-    fill_level_ghosts(level_.q);
-    fill_level_ghosts(level_.p);
+    fill_level_ghosts(level_.state.b);
+    fill_level_ghosts(level_.state.u);
+    fill_level_ghosts(level_.state.q);
+    fill_level_ghosts(level_.state.p);
 
     MultiFab plot_data(level_.ba, level_.dmap, 16, 0);
     for (MFIter mfi(plot_data); mfi.isValid(); ++mfi) {
         const Box& box = mfi.validbox();
-        const auto bx = level_.b.comp[vecops::X].const_array(mfi);
-        const auto by = level_.b.comp[vecops::Y].const_array(mfi);
-        const auto bz = level_.b.comp[vecops::Z].const_array(mfi);
-        const auto ux = level_.u.comp[vecops::X].const_array(mfi);
-        const auto uy = level_.u.comp[vecops::Y].const_array(mfi);
-        const auto uz = level_.u.comp[vecops::Z].const_array(mfi);
-        const auto qx = level_.q.comp[vecops::X].const_array(mfi);
-        const auto qy = level_.q.comp[vecops::Y].const_array(mfi);
-        const auto qz = level_.q.comp[vecops::Z].const_array(mfi);
-        const auto pxx = level_.p.comp[vecops::PXX].const_array(mfi);
-        const auto pxy = level_.p.comp[vecops::PXY].const_array(mfi);
-        const auto pxz = level_.p.comp[vecops::PXZ].const_array(mfi);
-        const auto pyy = level_.p.comp[vecops::PYY].const_array(mfi);
-        const auto pyz = level_.p.comp[vecops::PYZ].const_array(mfi);
-        const auto pzz = level_.p.comp[vecops::PZZ].const_array(mfi);
+        const auto bx = level_.state.b.comp[vecops::X].const_array(mfi);
+        const auto by = level_.state.b.comp[vecops::Y].const_array(mfi);
+        const auto bz = level_.state.b.comp[vecops::Z].const_array(mfi);
+        const auto ux = level_.state.u.comp[vecops::X].const_array(mfi);
+        const auto uy = level_.state.u.comp[vecops::Y].const_array(mfi);
+        const auto uz = level_.state.u.comp[vecops::Z].const_array(mfi);
+        const auto qx = level_.state.q.comp[vecops::X].const_array(mfi);
+        const auto qy = level_.state.q.comp[vecops::Y].const_array(mfi);
+        const auto qz = level_.state.q.comp[vecops::Z].const_array(mfi);
+        const auto pxx = level_.state.p.comp[vecops::PXX].const_array(mfi);
+        const auto pxy = level_.state.p.comp[vecops::PXY].const_array(mfi);
+        const auto pxz = level_.state.p.comp[vecops::PXZ].const_array(mfi);
+        const auto pyy = level_.state.p.comp[vecops::PYY].const_array(mfi);
+        const auto pyz = level_.state.p.comp[vecops::PYZ].const_array(mfi);
+        const auto pzz = level_.state.p.comp[vecops::PZZ].const_array(mfi);
         const auto out = plot_data.array(mfi);
         ParallelFor(box, [=] AMREX_GPU_DEVICE(int i, int j, int) noexcept {
             out(i, j, 0) = 0.5_rt * (bx(i, j, 0) + bx(i, j + 1, 0));
@@ -1152,23 +1241,8 @@ void Simulation::run() {
     while (time < cfg_.t_end - Real(1.0e-14)) {
         const Real dt = std::min(cfg_.dt, cfg_.t_end - time);
 
-        const Real rhs_wall_start = ParallelDescriptor::second();
-        compute_rhs(level_.b, level_.q, level_.u, level_.p, level_.rhs);
-        rhs_wall_total += ParallelDescriptor::second() - rhs_wall_start;
-        vecops::saxpy(level_.q, dt, level_.rhs);
-
-        const Real helmholtz_wall_start = ParallelDescriptor::second();
-        solve_helmholtz();
-        helmholtz_wall_total += ParallelDescriptor::second() - helmholtz_wall_start;
-
-        const Real velocity_wall_start = ParallelDescriptor::second();
-        compute_u_from_b(level_.b, level_.u);
-        fill_level_ghosts(level_.u);
-        velocity_wall_total += ParallelDescriptor::second() - velocity_wall_start;
-
-        const Real pressure_wall_start = ParallelDescriptor::second();
-        update_pressure(time + dt, dt, step + 1);
-        pressure_wall_total += ParallelDescriptor::second() - pressure_wall_start;
+        advance_rk4(time, dt, step,
+                    rhs_wall_total, helmholtz_wall_total, velocity_wall_total, pressure_wall_total);
 
         time += dt;
         ++step;

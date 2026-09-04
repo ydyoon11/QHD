@@ -8,14 +8,14 @@ dx = lx / nx
 dy = ly / ny
 
 dt_cfl = (dx**-2 + dy**-2) ** (-0.5)
-dt = dt_cfl * .5
+dt = dt_cfl * 0.3 * 5
 t_end = 800.0
 output_every = int(t_end / dt / 200)
 
-nu = 1.0e-3
+nu = 1.0e-2
 eta = 0
 
-output_dir = "output"
+output_dir = "output_1e-2"
 
 B0 = 1.0
 sigma = 2.0

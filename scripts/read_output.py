@@ -337,6 +337,85 @@ def _scale_to_finest(meta: dict, lev: int) -> int:
     return scale
 
 
+def _normalize_fields(fields: str | list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    if isinstance(fields, str):
+        return (fields,)
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for field in fields:
+        if field not in seen:
+            ordered.append(field)
+            seen.add(field)
+    if not ordered:
+        raise RuntimeError("At least one field must be requested")
+    return tuple(ordered)
+
+
+def _component_indices(meta: dict, fields: tuple[str, ...]) -> dict[str, int]:
+    missing = [field for field in fields if field not in meta["varnames"]]
+    if missing:
+        available = ", ".join(meta["varnames"])
+        requested = ", ".join(missing)
+        raise RuntimeError(f"Field(s) '{requested}' not found in plotfile. Available fields: {available}")
+    return {field: meta["varnames"].index(field) for field in fields}
+
+
+def _write_block_to_finest(
+    out: np.ndarray,
+    block: np.ndarray,
+    lo_i: int,
+    lo_j: int,
+    scale: int,
+) -> None:
+    ny, nx = block.shape
+    dst_j0 = lo_j * scale
+    dst_i0 = lo_i * scale
+
+    if scale == 1:
+        out[dst_j0 : dst_j0 + ny, dst_i0 : dst_i0 + nx] = block
+        return
+
+    expanded = np.repeat(np.repeat(block, scale, axis=0), scale, axis=1)
+    out[dst_j0 : dst_j0 + ny * scale, dst_i0 : dst_i0 + nx * scale] = expanded
+
+
+def _read_hdf5_components(
+    grp: h5py.Group,
+    comps: tuple[int, ...],
+    ncomp: int,
+    start: int,
+    end: int,
+    nx: int,
+    ny: int,
+) -> dict[int, np.ndarray]:
+    single_dataset_name = "data:datatype=0"
+    if single_dataset_name in grp:
+        block = np.asarray(grp[single_dataset_name][start:end], dtype=np.float64)
+        expected = ncomp * nx * ny
+        if block.size != expected:
+            raise RuntimeError(
+                f"Unexpected HDF5 dataset size in group {grp.name}: expected {expected} values, got {block.size}"
+            )
+        block = block.reshape((ncomp, ny, nx))
+        return {comp: block[comp] for comp in comps}
+
+    blocks: dict[int, np.ndarray] = {}
+    for comp in comps:
+        dataset_name = f"data:datatype={comp}"
+        if dataset_name not in grp:
+            raise RuntimeError(f"No AMReX field dataset found for component {comp} in HDF5 group {grp.name}")
+
+        block = np.asarray(grp[dataset_name][start:end], dtype=np.float64)
+        expected = nx * ny
+        if block.size != expected:
+            raise RuntimeError(
+                f"Unexpected HDF5 dataset size in group {grp.name}: expected {expected} values, got {block.size}"
+            )
+        blocks[comp] = block.reshape((ny, nx))
+    return blocks
+
+
 def read_grid_layout(plotfile_path: pathlib.Path) -> dict:
     meta = read_plotfile_metadata(plotfile_path)
     levels: list[dict] = []
@@ -398,13 +477,13 @@ def read_grid_layout(plotfile_path: pathlib.Path) -> dict:
     }
 
 
-def _read_global_field_directory(plotfile_dir: pathlib.Path, field: str) -> tuple[np.ndarray, dict]:
+def _read_global_fields_directory(plotfile_dir: pathlib.Path, fields: tuple[str, ...]) -> tuple[dict[str, np.ndarray], dict]:
     meta = read_plotfile_metadata(plotfile_dir)
-    if field not in meta["varnames"]:
-        raise RuntimeError(f"Field '{field}' not found in plotfile {plotfile_dir}")
-
-    comp = meta["varnames"].index(field)
-    out = np.zeros((meta["global_ny"], meta["global_nx"]), dtype=np.float64)
+    comps_by_field = _component_indices(meta, fields)
+    outputs = {
+        field: np.zeros((meta["global_ny"], meta["global_nx"]), dtype=np.float64)
+        for field in fields
+    }
 
     for lev in range(meta["finest_level"] + 1):
         level_dir = plotfile_dir / f"Level_{lev}"
@@ -416,51 +495,26 @@ def _read_global_field_directory(plotfile_dir: pathlib.Path, field: str) -> tupl
         for fab in fabs:
             nx = fab.hi_i - fab.lo_i + 1
             ny = fab.hi_j - fab.lo_j + 1
-            block = _read_fab(level_dir / fab.filename, fab.offset, ncomp, nx, ny)[comp]
+            blocks = _read_fab(level_dir / fab.filename, fab.offset, ncomp, nx, ny)
+            for field, comp in comps_by_field.items():
+                _write_block_to_finest(outputs[field], blocks[comp], fab.lo_i, fab.lo_j, scale)
 
-            for j in range(ny):
-                dst_j0 = (fab.lo_j + j) * scale
-                dst_j1 = dst_j0 + scale
-                for i in range(nx):
-                    dst_i0 = (fab.lo_i + i) * scale
-                    dst_i1 = dst_i0 + scale
-                    out[dst_j0:dst_j1, dst_i0:dst_i1] = block[j, i]
-
-    return out, meta
+    return outputs, meta
 
 
-def _read_hdf5_block(grp: h5py.Group, comp: int, ncomp: int, start: int, end: int, nx: int, ny: int) -> np.ndarray:
-    single_dataset_name = "data:datatype=0"
-    if single_dataset_name in grp:
-        block = np.asarray(grp[single_dataset_name][start:end], dtype=np.float64)
-        expected = ncomp * nx * ny
-        if block.size != expected:
-            raise RuntimeError(
-                f"Unexpected HDF5 dataset size in group {grp.name}: expected {expected} values, got {block.size}"
-            )
-        return block.reshape((ncomp, ny, nx))[comp]
-
-    multi_dataset_name = f"data:datatype={comp}"
-    if multi_dataset_name in grp:
-        block = np.asarray(grp[multi_dataset_name][start:end], dtype=np.float64)
-        expected = nx * ny
-        if block.size != expected:
-            raise RuntimeError(
-                f"Unexpected HDF5 dataset size in group {grp.name}: expected {expected} values, got {block.size}"
-            )
-        return block.reshape((ny, nx))
-
-    raise RuntimeError(f"No AMReX field dataset found for component {comp} in HDF5 group {grp.name}")
-
-
-def _read_global_field_hdf5(plotfile_path: pathlib.Path, field: str) -> tuple[np.ndarray, dict]:
+def _read_global_fields_hdf5(plotfile_path: pathlib.Path, fields: tuple[str, ...]) -> tuple[dict[str, np.ndarray], dict]:
     _require_h5py()
     meta = read_plotfile_metadata(plotfile_path)
-    if field not in meta["varnames"]:
-        raise RuntimeError(f"Field '{field}' not found in plotfile {plotfile_path}")
+    comps_by_field = _component_indices(meta, fields)
+    requested_comps = tuple(sorted(set(comps_by_field.values())))
+    fields_by_comp: dict[int, list[str]] = {}
+    for field, comp in comps_by_field.items():
+        fields_by_comp.setdefault(comp, []).append(field)
 
-    comp = meta["varnames"].index(field)
-    out = np.zeros((meta["global_ny"], meta["global_nx"]), dtype=np.float64)
+    outputs = {
+        field: np.zeros((meta["global_ny"], meta["global_nx"]), dtype=np.float64)
+        for field in fields
+    }
 
     with h5py.File(plotfile_path, "r") as h5:
         for lev in range(meta["finest_level"] + 1):
@@ -477,23 +531,28 @@ def _read_global_field_hdf5(plotfile_path: pathlib.Path, field: str) -> tuple[np
                 ny = box["hi_j"] - box["lo_j"] + 1
                 start = int(offsets[idx])
                 end = int(offsets[idx + 1])
-                block = _read_hdf5_block(grp, comp, meta["nvars"], start, end, nx, ny)
+                blocks = _read_hdf5_components(grp, requested_comps, meta["nvars"], start, end, nx, ny)
 
-                for j in range(ny):
-                    dst_j0 = (box["lo_j"] + j) * scale
-                    dst_j1 = dst_j0 + scale
-                    for i in range(nx):
-                        dst_i0 = (box["lo_i"] + i) * scale
-                        dst_i1 = dst_i0 + scale
-                        out[dst_j0:dst_j1, dst_i0:dst_i1] = block[j, i]
+                for comp, comp_block in blocks.items():
+                    for field in fields_by_comp[comp]:
+                        _write_block_to_finest(outputs[field], comp_block, box["lo_i"], box["lo_j"], scale)
 
-    return out, meta
+    return outputs, meta
+
+
+def read_global_fields(
+    plotfile_path: pathlib.Path,
+    fields: str | list[str] | tuple[str, ...],
+) -> tuple[dict[str, np.ndarray], dict]:
+    normalized_fields = _normalize_fields(fields)
+    if _is_hdf5_plotfile(plotfile_path):
+        return _read_global_fields_hdf5(plotfile_path, normalized_fields)
+    return _read_global_fields_directory(plotfile_path, normalized_fields)
 
 
 def read_global_field(plotfile_path: pathlib.Path, field: str) -> tuple[np.ndarray, dict]:
-    if _is_hdf5_plotfile(plotfile_path):
-        return _read_global_field_hdf5(plotfile_path, field)
-    return _read_global_field_directory(plotfile_path, field)
+    arrays, meta = read_global_fields(plotfile_path, (field,))
+    return arrays[field], meta
 
 
 def main() -> int:
