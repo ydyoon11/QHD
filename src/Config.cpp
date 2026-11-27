@@ -138,6 +138,7 @@ SimulationConfig SimulationConfig::from_file(const std::string& path) {
     cfg.config_dir = config_path.parent_path().string();
     std::string line;
     int line_no = 0;
+    bool nu_i_given = false;
 
     while (std::getline(in, line)) {
         ++line_no;
@@ -182,6 +183,13 @@ SimulationConfig SimulationConfig::from_file(const std::string& path) {
             cfg.nu = as_double();
         } else if (key == "eta") {
             cfg.eta = as_double();
+        } else if (key == "ions") {
+            cfg.ions = as_int();
+        } else if (key == "mass_ratio") {
+            cfg.mass_ratio = as_double();
+        } else if (key == "nu_i") {
+            cfg.nu_i = as_double();
+            nu_i_given = true;
         } else if (key == "init_b0") {
             cfg.init_b0 = as_double();
         } else if (key == "init_sigma") {
@@ -230,6 +238,26 @@ SimulationConfig SimulationConfig::from_file(const std::string& path) {
     }
     if (cfg.output_every <= 0) {
         throw std::runtime_error("output_every must be positive");
+    }
+
+    if (!nu_i_given) {
+        cfg.nu_i = cfg.nu;
+    }
+    if (cfg.ions != 0 && cfg.ions != 1) {
+        throw std::runtime_error("ions must be 0 or 1");
+    }
+    if (cfg.ions == 1) {
+        if (cfg.mass_ratio <= 0.0) {
+            throw std::runtime_error("ions = 1 needs mass_ratio > 0 (M = m_i/m_e)");
+        }
+        // No resistivity for now: the two-species model is collisionless.
+        // The existing term -eta*(Q + B) = -eta*omega_e assumes ions at rest, and no two-species
+        // version exists, so refuse rather than silently apply the electron-only term.
+        // Note eta defaults to 1e-3, not 0: an ion config must set eta = 0 explicitly.
+        if (cfg.eta != 0.0) {
+            throw std::runtime_error("ions = 1 needs eta = 0: the two-species model is collisionless "
+                                     "and has no resistive term");
+        }
     }
 
     return cfg;
